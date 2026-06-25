@@ -268,6 +268,103 @@ def _bar(ratio, width=8):
     return "▰" * filled + "▱" * (width - filled)
 
 
+def _fmt_tokens(n):
+    """Human-readable token count: 1234 -> '1.2K', 3_400_000 -> '3.4M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(int(n))
+
+
+# ── Claude Code local usage (Pro/Max) ────────────────────────────────────────
+#
+# Claude Pro/Max has no public usage API, so we read the token counts Claude
+# Code writes to ~/.claude/projects/**/*.jsonl and sum the rolling 5h window
+# (Claude's limits reset every 5 hours). This yields absolute tokens used — not
+# a percentage, since Anthropic does not publish the consumer plan limits.
+
+CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+CLAUDE_WINDOW = timedelta(hours=5)
+
+
+def _read_claude_events(since):
+    """Yield (timestamp, tokens) for assistant messages newer than `since`."""
+    for root, _dirs, files in os.walk(CLAUDE_PROJECTS_DIR):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc) < since:
+                    continue
+                f = open(path)
+            except OSError:
+                continue
+            with f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    msg = rec.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage")
+                    ts_raw = rec.get("timestamp")
+                    if not usage or not ts_raw:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if ts < since:
+                        continue
+                    yield ts, (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+
+
+def fetch_claude_usage():
+    """Return the current Claude Code 5h block's usage, or None if idle.
+
+    Claude Pro/Max limits reset on a 5-hour window that begins with your first
+    message. We group recent messages into 5h blocks (the same model as
+    ccusage) and report the active block: {tokens, messages, window_start,
+    reset_dt}. Tokens are billable input+output (cache excluded).
+    """
+    if not os.path.isdir(CLAUDE_PROJECTS_DIR):
+        return None
+
+    now = datetime.now(timezone.utc)
+    # Look back two windows so a block that started up to ~10h ago is captured.
+    events = sorted(_read_claude_events(now - 2 * CLAUDE_WINDOW))
+    if not events:
+        return None
+
+    # Walk forward, opening a new block whenever a message lands beyond the
+    # current block's 5h span. The last block is the active one.
+    block_start = events[0][0]
+    block_tokens = 0
+    block_msgs = 0
+    for ts, tok in events:
+        if ts - block_start >= CLAUDE_WINDOW:
+            block_start = ts
+            block_tokens = 0
+            block_msgs = 0
+        block_tokens += tok
+        block_msgs += 1
+
+    reset_dt = block_start + CLAUDE_WINDOW
+    if reset_dt < now:  # active block already elapsed -> nothing live
+        return None
+
+    return {
+        "tokens": block_tokens,
+        "messages": block_msgs,
+        "window_start": block_start,
+        "reset_dt": reset_dt,
+    }
+
+
 # ── custom settings window ───────────────────────────────────────────────────
 
 def _label(text, frame, size=13, color=None, bold=False, align=None):
@@ -384,10 +481,13 @@ class SettingsWindow(NSObject):
 
 ABOUT_TEXT = (
     "Track your GLM Coding Plan usage from the menu bar.\n\n"
-    "TOKENS\nAI model usage (glm-4, glm-5). Measured in tokens processed.\n\n"
-    "TOOLS\nAPI calls (search, web-reader, zread).\n"
+    "TOKENS\nGLM model usage (glm-4, glm-5). Measured in tokens processed.\n\n"
+    "TOOLS\nGLM tool calls (search, web-reader, zread).\n"
     "1000 calls per 5-hour rolling window.\n\n"
-    "Get your API key at https://z.ai/\n\n"
+    "CLAUDE\nIf you use Claude Code, shows tokens used in the current\n"
+    "5-hour window (read from local logs). No percentage — Anthropic\n"
+    "doesn't publish Pro/Max limits.\n\n"
+    "Get your GLM API key at https://z.ai/\n\n"
     "Share GLMUsage.app with friends — each person uses their own key."
 )
 
@@ -408,7 +508,7 @@ class AboutWindow(NSObject):
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             return
 
-        W, H = 420, 360
+        W, H = 440, 460
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False)
@@ -498,57 +598,56 @@ class GLMUsageApp(rumps.App):
             self._set([rumps.MenuItem(f"Error: {e}")])
             return
 
-        # Get token percentage and reset time for title
-        token_pct = d["token_pct"] if d["token_pct"] is not None else 0
-
-        # 5-hour window info for menu
-        time_pct = d["time_pct"]
-        time_left = d["time_left"]
-
-        # Title shows TOKEN % with TOKEN reset time from API
-        token_reset_seconds = d.get("token_reset_seconds")
-        if token_pct > 0 and token_reset_seconds is not None and token_reset_seconds > 0:
-            self.title = f"{token_pct}% · {fmt_countdown(token_reset_seconds)}"
+        # Title: GLM token % + countdown to its reset (the headline number).
+        token_pct = d["token_pct"] or 0
+        token_reset_secs = d.get("token_reset_seconds")
+        if token_pct > 0 and token_reset_secs and token_reset_secs > 0:
+            self.title = f"{token_pct}% · {fmt_countdown(token_reset_secs)}"
         else:
             self.title = f"{token_pct}%"
 
-        if d["active"] and d["time_reset_seconds"] is not None:
-            reset_str = d["time_reset_dt"].astimezone().strftime("%a %H:%M")
-        else:
-            reset_str = "Rolling 5h window"
-
-        # Token reset time from API
-        token_reset_str = ""
-        if d.get("token_reset_dt"):
-            token_reset_str = d["token_reset_dt"].astimezone().strftime("%a %H:%M")
-
-        # Tokens with progress bar first
         items = []
-        if d["token_pct"] is not None:
-            tok = f"Tokens: {_bar(d['token_pct']/100)} {d['token_pct']}%"
-            if isinstance(d["token_left"], (int, float)):
-                tok += f" · {d['token_left']} left"
-            items.append(rumps.MenuItem(tok))
-        else:
-            items.append(rumps.MenuItem("Tokens: —"))
-
-        # Token reset time below token progress bar
-        if token_reset_str:
-            items.append(rumps.MenuItem(f"resets {token_reset_str}"))
-
-        # Tools with progress bar
-        items.append(None)
-        head = f"Tools: {_bar(time_pct/100)} {time_pct}%"
-        if isinstance(time_left, (int, float)):
-            head += f" · {time_left} left"
-        items.append(rumps.MenuItem(head))
-
-        # Tools reset time (5h window)
-        if d["active"] and d["time_reset_dt"] is not None:
-            tools_reset_str = d["time_reset_dt"].astimezone().strftime("%a %H:%M")
-            items.append(rumps.MenuItem(f"resets {tools_reset_str}"))
+        items += self._glm_rows(d)
+        claude = fetch_claude_usage()
+        if claude:
+            items.append(None)
+            items += self._claude_rows(claude)
 
         self._set(items)
+
+    @staticmethod
+    def _reset_label(dt):
+        return f"resets {dt.astimezone().strftime('%a %H:%M')}"
+
+    def _glm_rows(self, d):
+        """Menu rows for the GLM token + tool quotas."""
+        rows = []
+        if d["token_pct"] is not None:
+            row = f"Tokens: {_bar(d['token_pct'] / 100)} {d['token_pct']}%"
+            if isinstance(d["token_left"], (int, float)):
+                row += f" · {d['token_left']} left"
+            rows.append(rumps.MenuItem(row))
+        else:
+            rows.append(rumps.MenuItem("Tokens: —"))
+        if d.get("token_reset_dt"):
+            rows.append(rumps.MenuItem(self._reset_label(d["token_reset_dt"])))
+
+        rows.append(None)
+        row = f"Tools: {_bar(d['time_pct'] / 100)} {d['time_pct']}%"
+        if isinstance(d["time_left"], (int, float)):
+            row += f" · {d['time_left']} left"
+        rows.append(rumps.MenuItem(row))
+        if d["active"] and d["time_reset_dt"] is not None:
+            rows.append(rumps.MenuItem(self._reset_label(d["time_reset_dt"])))
+        return rows
+
+    def _claude_rows(self, c):
+        """Menu rows for local Claude Code (Pro/Max) usage in the active 5h block."""
+        rows = [rumps.MenuItem(
+            f"Claude: {_fmt_tokens(c['tokens'])} tokens · {c['messages']} msgs")]
+        if c.get("reset_dt"):
+            rows.append(rumps.MenuItem(self._reset_label(c["reset_dt"])))
+        return rows
 
 
 if __name__ == "__main__":

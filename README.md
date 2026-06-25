@@ -7,10 +7,14 @@ Open the menu for a breakdown of both quotas.
 
 ## What it tracks
 
-- **Tokens** — AI model usage (glm-4, glm-5, …), measured in tokens processed.
+- **Tokens** — GLM model usage (glm-4, glm-5, …), measured in tokens processed.
   Resets on your subscription's schedule (reported by the API).
-- **Tools** — built-in tool calls (`search`, `web-reader`, `zread`).
+- **Tools** — built-in GLM tool calls (`search`, `web-reader`, `zread`).
   1000 calls per rolling 5-hour window.
+- **Claude** *(optional)* — if you use Claude Code, shows tokens used in the
+  current 5-hour window, read from local logs in `~/.claude/projects`.
+  Shown as an absolute token count, not a percentage: Anthropic doesn't
+  publish Claude Pro/Max limits, so there's nothing to compute a % against.
 
 ## Install
 
