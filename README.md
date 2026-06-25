@@ -20,6 +20,19 @@ Open the menu for a breakdown of both quotas.
   block's token count and from then on shows a **% bar** plus a **⚠️** in the
   menu-bar title as you approach it. "Reset learned limit" clears it.
 
+## Cost & history
+
+**Usage History…** (in the menu) shows:
+
+- **Claude API-equivalent cost** — what your current 5-hour block of Claude
+  Code usage *would* cost at public Anthropic API rates (input/output/cache
+  priced per model). A real dollar figure, computed from the exact token
+  counts in your local logs — handy for seeing the value of your subscription.
+- **GLM usage over time** — a log of snapshots (token %, tool-call count)
+  recorded while the app runs. GLM's API reports token usage only as a
+  percentage, so this is a history of *percentages*, not token totals — there
+  is no raw token count to total.
+
 ## Install
 
 ```bash

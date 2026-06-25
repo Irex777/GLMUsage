@@ -51,6 +51,8 @@ WINDOW_DURATION = timedelta(hours=5)
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(HERE, ".tray_config.json")
 WINDOW_FILE = os.path.join(HERE, ".window_state.json")
+HISTORY_FILE = os.path.join(HERE, ".glm_history.json")
+HISTORY_MAX = 2880  # snapshots kept (~2 days at one per minute)
 
 LOGIN_AGENT_LABEL = "com.glm.usage"
 LOGIN_AGENT_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{LOGIN_AGENT_LABEL}.plist")
@@ -247,6 +249,30 @@ def fetch_usage():
     }
 
 
+def record_glm_history(d):
+    """Append a usage snapshot to the GLM history log.
+
+    GLM's API exposes token usage only as a percentage (no raw token count),
+    so this records the percentage over time plus tool-call counts — not a true
+    token tally, which the API doesn't provide.
+    """
+    snap = {
+        "ts": int(datetime.now(timezone.utc).timestamp()),
+        "token_pct": d.get("token_pct"),
+        "tool_pct": d.get("time_pct"),
+        "tool_calls": d.get("time_value"),
+    }
+    history = _read_json(HISTORY_FILE) or []
+    # Skip if nothing changed since the last snapshot (avoid flat-line spam).
+    if history:
+        last = history[-1]
+        if (last.get("token_pct") == snap["token_pct"]
+                and last.get("tool_calls") == snap["tool_calls"]):
+            return
+    history.append(snap)
+    _write_json(HISTORY_FILE, history[-HISTORY_MAX:])
+
+
 def fmt_countdown(seconds):
     if seconds is None:
         return "—"
@@ -277,6 +303,13 @@ def _fmt_tokens(n):
     return str(int(n))
 
 
+def _fmt_cost(d):
+    """Human-readable dollar amount: 0.42 -> '$0.42', 12.5 -> '$12.50'."""
+    if d >= 100:
+        return f"${d:,.0f}"
+    return f"${d:.2f}"
+
+
 # ── Claude Code local usage (Pro/Max) ────────────────────────────────────────
 #
 # Claude Pro/Max has no public usage API, so we read the token counts Claude
@@ -287,6 +320,43 @@ def _fmt_tokens(n):
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CLAUDE_WINDOW = timedelta(hours=5)
 CLAUDE_WARN_RATIO = 0.9  # title shows ⚠️ at/above this fraction of the limit
+
+# Anthropic API list price per 1M tokens (input, output), by model-family prefix.
+# Used to estimate "as if you paid the public API" cost for local Claude Code usage.
+CLAUDE_PRICES = {
+    "fable":  (10.0, 50.0),
+    "opus":   (5.0, 25.0),
+    "sonnet": (3.0, 15.0),
+    "haiku":  (1.0, 5.0),
+}
+CLAUDE_DEFAULT_PRICE = (5.0, 25.0)  # unknown model -> assume Opus-tier
+
+
+def _claude_price(model):
+    """Return (input, output) $/1M for a model id, matched by family keyword."""
+    m = (model or "").lower()
+    for key, price in CLAUDE_PRICES.items():
+        if key in m:
+            return price
+    return CLAUDE_DEFAULT_PRICE
+
+
+def _message_cost(model, usage):
+    """Dollar cost of one assistant message priced at public API rates.
+
+    Includes cache: reads bill ~0.1x input, writes ~1.25x input.
+    """
+    in_rate, out_rate = _claude_price(model)
+    inp = usage.get("input_tokens") or 0
+    out = usage.get("output_tokens") or 0
+    cache_read = usage.get("cache_read_input_tokens") or 0
+    cache_write = usage.get("cache_creation_input_tokens") or 0
+    return (
+        inp * in_rate
+        + out * out_rate
+        + cache_read * in_rate * 0.1
+        + cache_write * in_rate * 1.25
+    ) / 1_000_000
 
 
 def get_claude_limit():
@@ -306,7 +376,11 @@ def set_claude_limit(tokens):
 
 
 def _read_claude_events(since):
-    """Yield (timestamp, tokens) for assistant messages newer than `since`."""
+    """Yield (timestamp, tokens, cost) for assistant messages newer than `since`.
+
+    `tokens` is billable input+output (cache excluded, for the quota number);
+    `cost` is the public-API dollar price of the message (cache included).
+    """
     for root, _dirs, files in os.walk(CLAUDE_PROJECTS_DIR):
         for name in files:
             if not name.endswith(".jsonl"):
@@ -337,7 +411,8 @@ def _read_claude_events(since):
                         continue
                     if ts < since:
                         continue
-                    yield ts, (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+                    tokens = (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+                    yield ts, tokens, _message_cost(msg.get("model"), usage)
 
 
 def fetch_claude_usage():
@@ -367,13 +442,16 @@ def fetch_claude_usage():
     block_start = events[0][0]
     block_tokens = 0
     block_msgs = 0
-    for ts, tok in events:
+    block_cost = 0.0
+    for ts, tok, cost in events:
         if ts - block_start >= CLAUDE_WINDOW:
             block_start = ts
             block_tokens = 0
             block_msgs = 0
+            block_cost = 0.0
         block_tokens += tok
         block_msgs += 1
+        block_cost += cost
 
     reset_dt = block_start + CLAUDE_WINDOW
     if reset_dt < now:  # active block already elapsed -> nothing live
@@ -394,6 +472,7 @@ def fetch_claude_usage():
     return {
         "tokens": block_tokens,
         "messages": block_msgs,
+        "cost": block_cost,
         "window_start": block_start,
         "reset_dt": reset_dt,
         "limit": limit,
@@ -527,6 +606,10 @@ ABOUT_TEXT = (
     "Pro/Max limits, so when you actually get cut off, click\n"
     "⚑ \"Hit Claude limit just now\" — the app pins your limit and\n"
     "then shows a % bar and a ⚠️ warning as you near it.\n\n"
+    "COST & HISTORY\nUsage History… shows what your Claude Code usage\n"
+    "would cost at public API rates, plus a log of GLM usage over\n"
+    "time. (GLM's API reports tokens only as a %, so its history is\n"
+    "percentages, not token totals.)\n\n"
     "Get your GLM API key at https://z.ai/\n\n"
     "Share GLMUsage.app with friends — each person uses their own key."
 )
@@ -548,7 +631,7 @@ class AboutWindow(NSObject):
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             return
 
-        W, H = 460, 520
+        W, H = 460, 580
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False)
@@ -591,6 +674,92 @@ class AboutWindow(NSObject):
         self.window.close()
 
 
+def build_history_text():
+    """Compose the usage-history report shown in the History window."""
+    lines = []
+
+    # GLM — percentage snapshots over time (no token counts available from API).
+    history = _read_json(HISTORY_FILE) or []
+    lines.append("GLM USAGE")
+    if history:
+        first = datetime.fromtimestamp(history[0]["ts"], tz=timezone.utc)
+        span_h = (history[-1]["ts"] - history[0]["ts"]) / 3600
+        tok = [h["token_pct"] for h in history if h.get("token_pct") is not None]
+        calls = [h["tool_calls"] for h in history if h.get("tool_calls") is not None]
+        lines.append(f"  Tracked since {first.astimezone():%b %d %H:%M}"
+                     f"  ({len(history)} snapshots, ~{span_h:.0f}h)")
+        if tok:
+            lines.append(f"  Token quota: now {tok[-1]}%, peak {max(tok)}%")
+        if calls:
+            lines.append(f"  Tool calls: now {calls[-1]}, peak {max(calls)} (per 5h window)")
+        lines.append("  Note: GLM's API reports tokens only as a %, so there's")
+        lines.append("  no exact token count to total — this is % over time.")
+    else:
+        lines.append("  No snapshots yet — keep the app running to build history.")
+
+    # Claude — real token counts and "as if direct API" cost.
+    lines.append("")
+    lines.append("CLAUDE CODE  (current 5h window)")
+    c = fetch_claude_usage()
+    if c:
+        lines.append(f"  Tokens used: {_fmt_tokens(c['tokens'])}  ·  {c['messages']} messages")
+        lines.append(f"  If billed at public API rates: {_fmt_cost(c['cost'])}")
+        lines.append("  (Real token counts from local logs; cache included.)")
+    else:
+        lines.append("  No Claude Code activity in the last 5 hours.")
+
+    return "\n".join(lines)
+
+
+class HistoryWindow(NSObject):
+    """Native window showing GLM snapshot history and Claude API-equivalent cost."""
+
+    def init(self):
+        self = objc.super(HistoryWindow, self).init()
+        if self is None:
+            return None
+        self.window = None
+        self.body = None
+        return self
+
+    def show(self):
+        if self.window is None:
+            W, H = 480, 420
+            style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False)
+            win.setTitle_("Usage History")
+            win.setReleasedWhenClosed_(False)
+            win.center()
+            content = win.contentView()
+
+            content.addSubview_(_label("Usage History",
+                                       NSMakeRect(24, H - 52, W - 48, 26),
+                                       size=18, bold=True))
+            body = _label("", NSMakeRect(24, 64, W - 48, H - 130), size=12,
+                          color=NSColor.labelColor())
+            body.cell().setWraps_(True)
+            body.setFont_(NSFont.userFixedPitchFontOfSize_(11))
+            content.addSubview_(body)
+            self.body = body
+
+            ok = NSButton.alloc().initWithFrame_(NSMakeRect(W - 24 - 100, 20, 100, 32))
+            ok.setTitle_("Close")
+            ok.setBezelStyle_(NSBezelStyleRounded)
+            ok.setKeyEquivalent_("\r")
+            ok.setTarget_(self)
+            ok.setAction_("close:")
+            content.addSubview_(ok)
+            self.window = win
+
+        self.body.setStringValue_(build_history_text())
+        self.window.makeKeyAndOrderFront_(None)
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+    def close_(self, _sender):
+        self.window.close()
+
+
 class GLMUsageApp(rumps.App):
     def __init__(self):
         super().__init__("…")
@@ -598,6 +767,7 @@ class GLMUsageApp(rumps.App):
         self._claude = None
         self._settings_window = SettingsWindow.alloc().initWithApp_(self)
         self._about_window = AboutWindow.alloc().init()
+        self._history_window = HistoryWindow.alloc().init()
         self._set([rumps.MenuItem("Loading…")])
 
     @rumps.timer(POLL_INTERVAL)
@@ -619,6 +789,10 @@ class GLMUsageApp(rumps.App):
         """Open the custom settings window."""
         self._settings_window.show()
 
+    def show_history(self, _sender=None):
+        """Open the usage-history window (GLM snapshots + Claude API cost)."""
+        self._history_window.show()
+
     def _set(self, items):
         # rumps' menu setter *appends* rather than replaces, so clear first
         # (otherwise entries pile up on every refresh).
@@ -626,6 +800,7 @@ class GLMUsageApp(rumps.App):
         self.menu = list(items) + [
             None,
             rumps.MenuItem("Refresh now", callback=self.refresh),
+            rumps.MenuItem("Usage History…", callback=self.show_history),
             rumps.MenuItem("Settings…", callback=self.show_settings),
             None,
             rumps.MenuItem("Quit", callback=self.quit),
@@ -638,6 +813,8 @@ class GLMUsageApp(rumps.App):
             self.title = "GLM ⚠"
             self._set([rumps.MenuItem(f"Error: {e}")])
             return
+
+        record_glm_history(d)
 
         # Title: GLM token % + countdown to its reset (the headline number).
         token_pct = d["token_pct"] or 0
@@ -696,6 +873,9 @@ class GLMUsageApp(rumps.App):
         else:
             head = f"Claude: {used} tokens · {c['messages']} msgs"
         rows = [rumps.MenuItem(head)]
+
+        # "If you paid the public API" cost for this 5h block.
+        rows.append(rumps.MenuItem(f"API cost: {_fmt_cost(c['cost'])} (this window)"))
 
         if c.get("reset_dt"):
             rows.append(rumps.MenuItem(self._reset_label(c["reset_dt"])))
