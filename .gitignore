@@ -1,0 +1,17 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets & local state
+.env
+.env.*
+.tray_config.json
+.window_state.json
+
+# Build artifacts
+GLMUsage.app/
+*.zip
+*.log
+.DS_Store
