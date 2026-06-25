@@ -888,6 +888,11 @@ class GLMUsageApp(rumps.App):
         if d.get("token_reset_dt"):
             rows.append(rumps.MenuItem(self._reset_label(d["token_reset_dt"])))
 
+        # Real GLM cost (from local logs) right under the token reset row.
+        g = fetch_glm_cost()
+        if g:
+            rows.append(rumps.MenuItem(f"API cost: {_fmt_cost(g['cost'])} (this window)"))
+
         rows.append(None)
         row = f"Tools: {_bar(d['time_pct'] / 100)} {d['time_pct']}%"
         if isinstance(d["time_left"], (int, float)):
