@@ -321,41 +321,49 @@ CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CLAUDE_WINDOW = timedelta(hours=5)
 CLAUDE_WARN_RATIO = 0.9  # title shows ⚠️ at/above this fraction of the limit
 
-# Anthropic API list price per 1M tokens (input, output), by model-family prefix.
-# Used to estimate "as if you paid the public API" cost for local Claude Code usage.
-CLAUDE_PRICES = {
-    "fable":  (10.0, 50.0),
-    "opus":   (5.0, 25.0),
-    "sonnet": (3.0, 15.0),
-    "haiku":  (1.0, 5.0),
+# Public API list price per 1M tokens, by model-family keyword.
+# (input, output, cache_read) — used to estimate "as if you paid per token" cost.
+# Anthropic cache writes bill ~1.25x input; GLM has no separate write rate.
+PRICES = {
+    # Anthropic
+    "fable":  (10.0, 50.0, 1.0),
+    "opus":   (5.0, 25.0, 0.5),
+    "sonnet": (3.0, 15.0, 0.3),
+    "haiku":  (1.0, 5.0, 0.1),
+    # Zhipu GLM (z.ai published rates)
+    "glm-5":  (1.40, 4.40, 0.26),   # glm-5.x family
+    "glm-4":  (0.43, 1.74, 0.10),   # glm-4.x family
 }
-CLAUDE_DEFAULT_PRICE = (5.0, 25.0)  # unknown model -> assume Opus-tier
+ANTHROPIC_DEFAULT = (5.0, 25.0, 0.5)  # unknown Anthropic model -> Opus-tier
 
 
-def _claude_price(model):
-    """Return (input, output) $/1M for a model id, matched by family keyword."""
+def _is_glm(model):
+    return "glm" in (model or "").lower()
+
+
+def _price(model):
+    """Return (input, output, cache_read) $/1M for a model id, by keyword."""
     m = (model or "").lower()
-    for key, price in CLAUDE_PRICES.items():
+    # Longest keys first so 'glm-5' wins over a bare 'glm' substring match.
+    for key in sorted(PRICES, key=len, reverse=True):
         if key in m:
-            return price
-    return CLAUDE_DEFAULT_PRICE
+            return PRICES[key]
+    return ANTHROPIC_DEFAULT
 
 
 def _message_cost(model, usage):
-    """Dollar cost of one assistant message priced at public API rates.
-
-    Includes cache: reads bill ~0.1x input, writes ~1.25x input.
-    """
-    in_rate, out_rate = _claude_price(model)
+    """Dollar cost of one assistant message at public per-token API rates."""
+    in_rate, out_rate, cache_rate = _price(model)
     inp = usage.get("input_tokens") or 0
     out = usage.get("output_tokens") or 0
     cache_read = usage.get("cache_read_input_tokens") or 0
     cache_write = usage.get("cache_creation_input_tokens") or 0
+    write_rate = cache_rate if _is_glm(model) else in_rate * 1.25
     return (
         inp * in_rate
         + out * out_rate
-        + cache_read * in_rate * 0.1
-        + cache_write * in_rate * 1.25
+        + cache_read * cache_rate
+        + cache_write * write_rate
     ) / 1_000_000
 
 
@@ -411,8 +419,9 @@ def _read_claude_events(since):
                         continue
                     if ts < since:
                         continue
+                    model = msg.get("model")
                     tokens = (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
-                    yield ts, tokens, _message_cost(msg.get("model"), usage)
+                    yield ts, tokens, _message_cost(model, usage), _is_glm(model)
 
 
 def fetch_claude_usage():
@@ -433,7 +442,10 @@ def fetch_claude_usage():
 
     now = datetime.now(timezone.utc)
     # Look back two windows so a block that started up to ~10h ago is captured.
-    events = sorted(_read_claude_events(now - 2 * CLAUDE_WINDOW))
+    # Only Claude (Anthropic) messages count toward the Claude window — GLM/local
+    # models logged by the same coding tool are billed separately.
+    events = sorted(e for e in _read_claude_events(now - 2 * CLAUDE_WINDOW)
+                    if not e[3])
     if not events:
         return None
 
@@ -443,7 +455,7 @@ def fetch_claude_usage():
     block_tokens = 0
     block_msgs = 0
     block_cost = 0.0
-    for ts, tok, cost in events:
+    for ts, tok, cost, _is_glm_evt in events:
         if ts - block_start >= CLAUDE_WINDOW:
             block_start = ts
             block_tokens = 0
@@ -480,6 +492,29 @@ def fetch_claude_usage():
         "seen_max": cfg.get("claude_seen_max", 0),
         "pct": pct,
     }
+
+
+def fetch_glm_cost():
+    """Real GLM cost from local coding-tool logs, priced at z.ai per-token rates.
+
+    Unlike the GLM quota API (percentage only), the coding tool logs exact GLM
+    token counts per message. We sum them over GLM's current 5h quota window and
+    price each at its model's published API rate. Returns
+    {tokens, messages, cost, window} or None if there's no GLM usage logged.
+    """
+    if not os.path.isdir(CLAUDE_PROJECTS_DIR):
+        return None
+    since = datetime.now(timezone.utc) - CLAUDE_WINDOW
+    tokens = msgs = 0
+    cost = 0.0
+    for _ts, tok, c, is_glm in _read_claude_events(since):
+        if is_glm:
+            tokens += tok
+            msgs += 1
+            cost += c
+    if not msgs:
+        return None
+    return {"tokens": tokens, "messages": msgs, "cost": cost, "window_h": 5}
 
 
 # ── custom settings window ───────────────────────────────────────────────────
@@ -606,10 +641,10 @@ ABOUT_TEXT = (
     "Pro/Max limits, so when you actually get cut off, click\n"
     "⚑ \"Hit Claude limit just now\" — the app pins your limit and\n"
     "then shows a % bar and a ⚠️ warning as you near it.\n\n"
-    "COST & HISTORY\nUsage History… shows what your Claude Code usage\n"
-    "would cost at public API rates, plus a log of GLM usage over\n"
-    "time. (GLM's API reports tokens only as a %, so its history is\n"
-    "percentages, not token totals.)\n\n"
+    "COST & HISTORY\nUsage History… shows what your GLM and Claude Code\n"
+    "usage would cost at each provider's public per-token API rates,\n"
+    "computed from the real token counts in your local coding-tool\n"
+    "logs — plus GLM's quota-percentage history from the z.ai API.\n\n"
     "Get your GLM API key at https://z.ai/\n\n"
     "Share GLMUsage.app with friends — each person uses their own key."
 )
@@ -678,24 +713,22 @@ def build_history_text():
     """Compose the usage-history report shown in the History window."""
     lines = []
 
-    # GLM — percentage snapshots over time (no token counts available from API).
-    history = _read_json(HISTORY_FILE) or []
-    lines.append("GLM USAGE")
-    if history:
-        first = datetime.fromtimestamp(history[0]["ts"], tz=timezone.utc)
-        span_h = (history[-1]["ts"] - history[0]["ts"]) / 3600
-        tok = [h["token_pct"] for h in history if h.get("token_pct") is not None]
-        calls = [h["tool_calls"] for h in history if h.get("tool_calls") is not None]
-        lines.append(f"  Tracked since {first.astimezone():%b %d %H:%M}"
-                     f"  ({len(history)} snapshots, ~{span_h:.0f}h)")
-        if tok:
-            lines.append(f"  Token quota: now {tok[-1]}%, peak {max(tok)}%")
-        if calls:
-            lines.append(f"  Tool calls: now {calls[-1]}, peak {max(calls)} (per 5h window)")
-        lines.append("  Note: GLM's API reports tokens only as a %, so there's")
-        lines.append("  no exact token count to total — this is % over time.")
+    # GLM — real cost from local coding-tool logs (exact token counts), plus
+    # the quota-percentage history from the z.ai API.
+    lines.append("GLM USAGE  (current 5h window)")
+    g = fetch_glm_cost()
+    if g:
+        lines.append(f"  Tokens used: {_fmt_tokens(g['tokens'])}  ·  {g['messages']} messages")
+        lines.append(f"  If billed at z.ai API rates: {_fmt_cost(g['cost'])}")
+        lines.append("  (Real GLM token counts from local logs.)")
     else:
-        lines.append("  No snapshots yet — keep the app running to build history.")
+        lines.append("  No GLM usage logged in the last 5 hours.")
+
+    history = _read_json(HISTORY_FILE) or []
+    if history:
+        tok = [h["token_pct"] for h in history if h.get("token_pct") is not None]
+        if tok:
+            lines.append(f"  Quota (from z.ai API): now {tok[-1]}%, peak {max(tok)}%")
 
     # Claude — real token counts and "as if direct API" cost.
     lines.append("")

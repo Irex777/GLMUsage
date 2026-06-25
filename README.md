@@ -22,16 +22,21 @@ Open the menu for a breakdown of both quotas.
 
 ## Cost & history
 
-**Usage History…** (in the menu) shows:
+**Usage History…** (in the menu) shows real per-token cost for both providers,
+computed from the exact token counts in your local coding-tool logs
+(`~/.claude/projects`):
 
-- **Claude API-equivalent cost** — what your current 5-hour block of Claude
-  Code usage *would* cost at public Anthropic API rates (input/output/cache
-  priced per model). A real dollar figure, computed from the exact token
-  counts in your local logs — handy for seeing the value of your subscription.
-- **GLM usage over time** — a log of snapshots (token %, tool-call count)
-  recorded while the app runs. GLM's API reports token usage only as a
-  percentage, so this is a history of *percentages*, not token totals — there
-  is no raw token count to total.
+- **GLM API-equivalent cost** — what your current 5-hour block of GLM usage
+  *would* cost at z.ai's published rates (e.g. GLM 5.2 at $1.40/$4.40 per 1M
+  in/out). Real token counts, priced per GLM model.
+- **Claude API-equivalent cost** — same, at public Anthropic rates
+  (input/output/cache priced per model).
+- **GLM quota %** — the percentage history from the z.ai quota API (the API
+  exposes the quota only as a percentage, so this complements the token-based
+  cost above).
+
+Both cost figures are billed-per-token estimates for comparison — they show the
+value of your flat-rate subscriptions, not an actual charge.
 
 ## Install
 
