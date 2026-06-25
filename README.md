@@ -13,8 +13,12 @@ Open the menu for a breakdown of both quotas.
   1000 calls per rolling 5-hour window.
 - **Claude** *(optional)* — if you use Claude Code, shows tokens used in the
   current 5-hour window, read from local logs in `~/.claude/projects`.
-  Shown as an absolute token count, not a percentage: Anthropic doesn't
-  publish Claude Pro/Max limits, so there's nothing to compute a % against.
+
+  Anthropic doesn't publish Claude Pro/Max limits, so there's no % to show by
+  default. To get one, **calibrate**: the next time Claude actually cuts you
+  off, click **⚑ Hit Claude limit just now**. The app pins your limit to that
+  block's token count and from then on shows a **% bar** plus a **⚠️** in the
+  menu-bar title as you approach it. "Reset learned limit" clears it.
 
 ## Install
 

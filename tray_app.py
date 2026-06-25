@@ -286,6 +286,23 @@ def _fmt_tokens(n):
 
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CLAUDE_WINDOW = timedelta(hours=5)
+CLAUDE_WARN_RATIO = 0.9  # title shows ⚠️ at/above this fraction of the limit
+
+
+def get_claude_limit():
+    """Return the learned/calibrated Claude 5h token limit, or None if unknown."""
+    val = load_config().get("claude_limit")
+    return int(val) if val else None
+
+
+def set_claude_limit(tokens):
+    """Persist the Claude token limit (None clears it)."""
+    cfg = load_config()
+    if tokens:
+        cfg["claude_limit"] = int(tokens)
+    else:
+        cfg.pop("claude_limit", None)
+    save_config(cfg)
 
 
 def _read_claude_events(since):
@@ -328,8 +345,13 @@ def fetch_claude_usage():
 
     Claude Pro/Max limits reset on a 5-hour window that begins with your first
     message. We group recent messages into 5h blocks (the same model as
-    ccusage) and report the active block: {tokens, messages, window_start,
-    reset_dt}. Tokens are billable input+output (cache excluded).
+    ccusage) and report the active block. Tokens are billable input+output
+    (cache excluded).
+
+    Returns {tokens, messages, window_start, reset_dt, limit, pct}. `limit` is
+    the learned ceiling (None until known); `pct` is the fraction used or None.
+    Anthropic doesn't publish the limit, so we also keep an auto "high-water
+    mark": the largest block seen without being cut off is a safe lower bound.
     """
     if not os.path.isdir(CLAUDE_PROJECTS_DIR):
         return None
@@ -357,11 +379,27 @@ def fetch_claude_usage():
     if reset_dt < now:  # active block already elapsed -> nothing live
         return None
 
+    # Track the largest block ever seen (a safe lower bound on the real limit),
+    # but only show a percentage once the user has actually calibrated — a
+    # high-water mark would otherwise always read 100% and look alarming.
+    cfg = load_config()
+    if block_tokens > cfg.get("claude_seen_max", 0):
+        cfg["claude_seen_max"] = block_tokens
+        save_config(cfg)
+
+    calibrated = cfg.get("claude_limit")
+    limit = int(calibrated) if calibrated else None
+    pct = round(block_tokens / limit * 100) if limit else None
+
     return {
         "tokens": block_tokens,
         "messages": block_msgs,
         "window_start": block_start,
         "reset_dt": reset_dt,
+        "limit": limit,
+        "calibrated": bool(calibrated),
+        "seen_max": cfg.get("claude_seen_max", 0),
+        "pct": pct,
     }
 
 
@@ -485,8 +523,10 @@ ABOUT_TEXT = (
     "TOOLS\nGLM tool calls (search, web-reader, zread).\n"
     "1000 calls per 5-hour rolling window.\n\n"
     "CLAUDE\nIf you use Claude Code, shows tokens used in the current\n"
-    "5-hour window (read from local logs). No percentage — Anthropic\n"
-    "doesn't publish Pro/Max limits.\n\n"
+    "5-hour window (read from local logs). Anthropic doesn't publish\n"
+    "Pro/Max limits, so when you actually get cut off, click\n"
+    "⚑ \"Hit Claude limit just now\" — the app pins your limit and\n"
+    "then shows a % bar and a ⚠️ warning as you near it.\n\n"
     "Get your GLM API key at https://z.ai/\n\n"
     "Share GLMUsage.app with friends — each person uses their own key."
 )
@@ -508,7 +548,7 @@ class AboutWindow(NSObject):
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             return
 
-        W, H = 440, 460
+        W, H = 460, 520
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False)
@@ -555,6 +595,7 @@ class GLMUsageApp(rumps.App):
     def __init__(self):
         super().__init__("…")
         _set_app_icon()
+        self._claude = None
         self._settings_window = SettingsWindow.alloc().initWithApp_(self)
         self._about_window = AboutWindow.alloc().init()
         self._set([rumps.MenuItem("Loading…")])
@@ -602,17 +643,22 @@ class GLMUsageApp(rumps.App):
         token_pct = d["token_pct"] or 0
         token_reset_secs = d.get("token_reset_seconds")
         if token_pct > 0 and token_reset_secs and token_reset_secs > 0:
-            self.title = f"{token_pct}% · {fmt_countdown(token_reset_secs)}"
+            title = f"{token_pct}% · {fmt_countdown(token_reset_secs)}"
         else:
-            self.title = f"{token_pct}%"
+            title = f"{token_pct}%"
 
-        items = []
-        items += self._glm_rows(d)
-        claude = fetch_claude_usage()
-        if claude:
+        items = list(self._glm_rows(d))
+
+        self._claude = fetch_claude_usage()
+        if self._claude:
             items.append(None)
-            items += self._claude_rows(claude)
+            items += self._claude_rows(self._claude)
+            # Warn in the title bar when the Claude 5h window is nearly spent.
+            pct = self._claude.get("pct")
+            if pct is not None and pct >= CLAUDE_WARN_RATIO * 100:
+                title += " ⚠️"
 
+        self.title = title
         self._set(items)
 
     @staticmethod
@@ -643,11 +689,37 @@ class GLMUsageApp(rumps.App):
 
     def _claude_rows(self, c):
         """Menu rows for local Claude Code (Pro/Max) usage in the active 5h block."""
-        rows = [rumps.MenuItem(
-            f"Claude: {_fmt_tokens(c['tokens'])} tokens · {c['messages']} msgs")]
+        used = _fmt_tokens(c["tokens"])
+        limit = c.get("limit")
+        if limit:
+            head = f"Claude: {_bar(c['tokens'] / limit)} {c['pct']}% · {used}/{_fmt_tokens(limit)}"
+        else:
+            head = f"Claude: {used} tokens · {c['messages']} msgs"
+        rows = [rumps.MenuItem(head)]
+
         if c.get("reset_dt"):
             rows.append(rumps.MenuItem(self._reset_label(c["reset_dt"])))
+
+        # Calibration: when you actually get cut off, pin the limit to right now.
+        rows.append(rumps.MenuItem("⚑ Hit Claude limit just now",
+                                   callback=self.calibrate_claude))
+        if c.get("calibrated"):
+            rows.append(rumps.MenuItem("Reset learned limit",
+                                       callback=self.reset_claude_limit))
         return rows
+
+    def calibrate_claude(self, _sender=None):
+        """Pin the Claude limit to the current block's token count."""
+        c = getattr(self, "_claude", None)
+        if not c:
+            return
+        set_claude_limit(c["tokens"])
+        self.update()
+
+    def reset_claude_limit(self, _sender=None):
+        """Forget the calibrated limit and fall back to the auto high-water mark."""
+        set_claude_limit(None)
+        self.update()
 
 
 if __name__ == "__main__":
