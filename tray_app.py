@@ -425,13 +425,33 @@ def _read_claude_events(since):
                     yield ts, tokens, _message_cost(model, usage), _is_glm(model)
 
 
+def _get_claude_window_bounds(now, offset_hours=0):
+    """Calculate the current Claude 5-hour window boundaries based on calendar time.
+
+    The Claude API uses fixed 5-hour windows, not user-activity-based windows.
+    offset_hours allows configuring the window start offset (e.g., 7.17 for 07:10 UTC).
+
+    Returns (window_start, reset_dt) as UTC datetime objects.
+    """
+    offset_seconds = offset_hours * 3600
+    # Unix timestamp of now, adjusted by offset
+    now_ts = now.timestamp()
+    adjusted = now_ts - offset_seconds
+    # Which 5-hour window number is this?
+    window_num = int(adjusted // (5 * 3600))
+    # Calculate the start of this window
+    window_start_ts = window_num * 5 * 3600 + offset_seconds
+    window_start = datetime.fromtimestamp(window_start_ts, tz=timezone.utc)
+    reset_dt = window_start + CLAUDE_WINDOW
+    return window_start, reset_dt
+
+
 def fetch_claude_usage():
     """Return the current Claude Code 5h block's usage, or None if idle.
 
-    Claude Pro/Max limits reset on a 5-hour window that begins with your first
-    message. We group recent messages into 5h blocks (the same model as
-    ccusage) and report the active block. Tokens are billable input+output
-    (cache excluded).
+    Claude Pro/Max limits reset on a fixed 5-hour calendar window. We count
+    tokens used within the current window (determined by the configured offset)
+    and report usage. Tokens are billable input+output (cache excluded).
 
     Returns {tokens, messages, window_start, reset_dt, limit, pct}. `limit` is
     the learned ceiling (None until known); `pct` is the fraction used or None.
@@ -442,38 +462,37 @@ def fetch_claude_usage():
         return None
 
     now = datetime.now(timezone.utc)
-    # Look back two windows so a block that started up to ~10h ago is captured.
+    cfg = load_config()
+    # Get configured offset (hours since midnight UTC). Default 0 (00:00 UTC windows)
+    offset_hours = cfg.get("claude_reset_offset", 0)
+
+    window_start, reset_dt = _get_claude_window_bounds(now, offset_hours)
+
     # Only Claude (Anthropic) messages count toward the Claude window — GLM/local
     # models logged by the same coding tool are billed separately.
-    events = sorted(e for e in _read_claude_events(now - 2 * CLAUDE_WINDOW)
+    events = sorted(e for e in _read_claude_events(window_start)
                     if not e[3])
     if not events:
-        return None
+        return {
+            "tokens": 0,
+            "messages": 0,
+            "cost": 0.0,
+            "window_start": window_start,
+            "reset_dt": reset_dt,
+            "limit": None,
+            "calibrated": False,
+            "seen_max": cfg.get("claude_seen_max", 0),
+            "pct": None,
+        }
 
-    # Walk forward, opening a new block whenever a message lands beyond the
-    # current block's 5h span. The last block is the active one.
-    block_start = events[0][0]
-    block_tokens = 0
-    block_msgs = 0
-    block_cost = 0.0
-    for ts, tok, cost, _is_glm_evt in events:
-        if ts - block_start >= CLAUDE_WINDOW:
-            block_start = ts
-            block_tokens = 0
-            block_msgs = 0
-            block_cost = 0.0
-        block_tokens += tok
-        block_msgs += 1
-        block_cost += cost
-
-    reset_dt = block_start + CLAUDE_WINDOW
-    if reset_dt < now:  # active block already elapsed -> nothing live
-        return None
+    # Sum all tokens within the current window
+    block_tokens = sum(tok for ts, tok, cost, _ in events)
+    block_msgs = len(events)
+    block_cost = sum(cost for ts, tok, cost, _ in events)
 
     # Track the largest block ever seen (a safe lower bound on the real limit),
     # but only show a percentage once the user has actually calibrated — a
     # high-water mark would otherwise always read 100% and look alarming.
-    cfg = load_config()
     if block_tokens > cfg.get("claude_seen_max", 0):
         cfg["claude_seen_max"] = block_tokens
         save_config(cfg)
@@ -486,7 +505,7 @@ def fetch_claude_usage():
         "tokens": block_tokens,
         "messages": block_msgs,
         "cost": block_cost,
-        "window_start": block_start,
+        "window_start": window_start,
         "reset_dt": reset_dt,
         "limit": limit,
         "calibrated": bool(calibrated),
@@ -608,7 +627,7 @@ class SettingsWindow(NSObject):
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             return
 
-        W, H = 420, 300
+        W, H = 420, 380
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, W, H), style, NSBackingStoreBuffered, False)
@@ -641,13 +660,32 @@ class SettingsWindow(NSObject):
                       size=11, color=NSColor.tertiaryLabelColor())
         content.addSubview_(hint)
 
+        # Claude reset offset section
+        content.addSubview_(_label("CLAUDE QUOTA RESET", NSMakeRect(24, H - 212, W - 48, 16),
+                                   size=10, color=NSColor.tertiaryLabelColor(), bold=True))
+        content.addSubview_(_label("When does your 5h Claude quota window reset? (UTC time)",
+                                   NSMakeRect(24, H - 232, W - 48, 16),
+                                   size=11, color=NSColor.secondaryLabelColor()))
+
+        offset_field = NSTextField.alloc().initWithFrame_(NSMakeRect(24, H - 262, 80, 26))
+        offset = load_config().get("claude_reset_offset")
+        offset_field.setStringValue_(str(offset) if offset is not None else "")
+        offset_field.setPlaceholderString_("7.17")
+        offset_field.setFont_(NSFont.systemFontOfSize_(12))
+        content.addSubview_(offset_field)
+        self.offset_field = offset_field
+
+        content.addSubview_(_label("hours from midnight UTC (e.g., 7.17 = 07:10 UTC)",
+                                   NSMakeRect(116, H - 258, W - 140, 20),
+                                   size=11, color=NSColor.tertiaryLabelColor()))
+
         # Launch at login row
-        content.addSubview_(_label("STARTUP", NSMakeRect(24, H - 212, W - 48, 16),
+        content.addSubview_(_label("STARTUP", NSMakeRect(24, H - 292, W - 48, 16),
                                    size=10, color=NSColor.tertiaryLabelColor(), bold=True))
         content.addSubview_(_label("Launch GLM Usage at login",
-                                   NSMakeRect(24, H - 238, 280, 20), size=13))
+                                   NSMakeRect(24, H - 318, 280, 20), size=13))
 
-        switch = NSSwitch.alloc().initWithFrame_(NSMakeRect(W - 24 - 50, H - 240, 50, 24))
+        switch = NSSwitch.alloc().initWithFrame_(NSMakeRect(W - 24 - 50, H - 320, 50, 24))
         switch.setState_(NSControlStateValueOn if get_login_item_enabled()
                          else NSControlStateValueOff)
         switch.setTarget_(self)
@@ -680,8 +718,25 @@ class SettingsWindow(NSObject):
         set_login_item(enabled)
 
     def save_(self, _sender):
+        cfg = load_config()
         new_key = self.field.stringValue().strip()
-        save_config({"api_key": new_key} if new_key else {})
+        if new_key:
+            cfg["api_key"] = new_key
+        elif "api_key" in cfg:
+            del cfg["api_key"]
+
+        # Save Claude reset offset if provided
+        offset_str = self.offset_field.stringValue().strip()
+        if offset_str:
+            try:
+                offset = float(offset_str)
+                cfg["claude_reset_offset"] = offset
+            except ValueError:
+                pass  # Invalid input, don't save
+        elif "claude_reset_offset" in cfg:
+            del cfg["claude_reset_offset"]
+
+        save_config(cfg)
         self.app.refresh()
         self.window.close()
 
@@ -699,6 +754,8 @@ ABOUT_TEXT = (
     "Pro/Max limits, so when you actually get cut off, click\n"
     "⚑ \"Hit Claude limit just now\" — the app pins your limit and\n"
     "then shows a % bar and a ⚠️ warning as you near it.\n\n"
+    "Configure your Claude reset offset in Settings if the displayed\n"
+    "reset time doesn't match the actual API window.\n\n"
     "COST & HISTORY\nUsage History… shows what your GLM and Claude Code\n"
     "usage would cost at each provider's public per-token API rates,\n"
     "computed from the real token counts in your local coding-tool\n"
