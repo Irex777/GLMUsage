@@ -53,6 +53,7 @@ CONFIG_FILE = os.path.join(HERE, ".tray_config.json")
 WINDOW_FILE = os.path.join(HERE, ".window_state.json")
 HISTORY_FILE = os.path.join(HERE, ".glm_history.json")
 HISTORY_MAX = 2880  # snapshots kept (~2 days at one per minute)
+LEDGER_FILE = os.path.join(HERE, ".usage_ledger.json")
 
 LOGIN_AGENT_LABEL = "com.glm.usage"
 LOGIN_AGENT_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{LOGIN_AGENT_LABEL}.plist")
@@ -517,6 +518,63 @@ def fetch_glm_cost():
     return {"tokens": tokens, "messages": msgs, "cost": cost, "window_h": 5}
 
 
+def update_ledger():
+    """Maintain a lifetime running total across all windows, deduped by uuid.
+
+    Logs eventually get pruned, so a re-scan can't be trusted to see every
+    message. We persist cumulative totals plus the set of seen record uuids, and
+    only add messages we haven't counted before — so totals keep growing
+    correctly even as old transcripts disappear.
+
+    Returns the ledger dict: {glm: {...}, claude: {...}, since} where each side
+    has tokens/messages/cost; `since` is when tracking began.
+    """
+    led = _read_json(LEDGER_FILE) or {
+        "since": int(datetime.now(timezone.utc).timestamp()),
+        "seen": [],
+        "glm": {"tokens": 0, "messages": 0, "cost": 0.0},
+        "claude": {"tokens": 0, "messages": 0, "cost": 0.0},
+    }
+    seen = set(led.get("seen", []))
+    added = False
+
+    for root, _dirs, files in os.walk(CLAUDE_PROJECTS_DIR):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                f = open(os.path.join(root, name))
+            except OSError:
+                continue
+            with f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    uid = rec.get("uuid")
+                    msg = rec.get("message")
+                    if not uid or uid in seen or not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+                    seen.add(uid)
+                    added = True
+                    model = msg.get("model")
+                    side = led["glm"] if _is_glm(model) else led["claude"]
+                    side["tokens"] += (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+                    side["messages"] += 1
+                    side["cost"] += _message_cost(model, usage)
+
+    if added:
+        # Cap the seen-set so the file can't grow without bound; pruning old
+        # uuids only risks re-counting messages that are themselves long pruned.
+        led["seen"] = list(seen)[-200_000:]
+        _write_json(LEDGER_FILE, led)
+    return led
+
+
 # ── custom settings window ───────────────────────────────────────────────────
 
 def _label(text, frame, size=13, color=None, bold=False, align=None):
@@ -741,6 +799,20 @@ def build_history_text():
     else:
         lines.append("  No Claude Code activity in the last 5 hours.")
 
+    # Lifetime totals across all windows (cumulative, deduped).
+    led = update_ledger()
+    glm, cla = led["glm"], led["claude"]
+    if glm["messages"] or cla["messages"]:
+        lines.append("")
+        lines.append("ALL-TIME  (every window, cumulative)")
+        if glm["messages"]:
+            lines.append(f"  GLM:    {_fmt_cost(glm['cost'])}"
+                         f"  ({_fmt_tokens(glm['tokens'])} tok, {glm['messages']} msgs)")
+        if cla["messages"]:
+            lines.append(f"  Claude: {_fmt_cost(cla['cost'])}"
+                         f"  ({_fmt_tokens(cla['tokens'])} tok, {cla['messages']} msgs)")
+        lines.append(f"  Total:  {_fmt_cost(glm['cost'] + cla['cost'])} of API-rate usage")
+
     return "\n".join(lines)
 
 
@@ -848,6 +920,10 @@ class GLMUsageApp(rumps.App):
             return
 
         record_glm_history(d)
+        try:
+            update_ledger()
+        except Exception:
+            pass  # ledger is best-effort; never block the refresh
 
         # Title: GLM token % + countdown to its reset (the headline number).
         token_pct = d["token_pct"] or 0

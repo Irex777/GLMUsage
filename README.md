@@ -35,7 +35,12 @@ computed from the exact token counts in your local coding-tool logs
   exposes the quota only as a percentage, so this complements the token-based
   cost above).
 
-Both cost figures are billed-per-token estimates for comparison — they show the
+It also keeps an **all-time total** across every window — a cumulative ledger of
+GLM and Claude token cost that keeps growing as you use them. It dedupes by log
+record ID, so it stays correct even after old transcripts are pruned (it counts
+each message once, then remembers it).
+
+All cost figures are billed-per-token estimates for comparison — they show the
 value of your flat-rate subscriptions, not an actual charge.
 
 ## Install

@@ -10,6 +10,7 @@ __pycache__/
 .tray_config.json
 .window_state.json
 .glm_history.json
+.usage_ledger.json
 
 # Build artifacts
 GLMUsage.app/
